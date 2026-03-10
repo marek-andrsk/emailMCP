@@ -78,11 +78,11 @@ APPROVE_HTML = """<!DOCTYPE html>
     <title>Authorize Email MCP</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
-        body { font-family: system-ui, sans-serif; max-width: 400px; margin: 80px auto; padding: 0 20px; }
-        h1 { font-size: 1.3em; }
-        input[type=password] { width: 100%%; padding: 10px; margin: 10px 0; box-sizing: border-box; font-size: 1em; }
-        button { padding: 10px 24px; font-size: 1em; cursor: pointer; }
-        .error { color: #c00; }
+        body {{ font-family: system-ui, sans-serif; max-width: 400px; margin: 80px auto; padding: 0 20px; }}
+        h1 {{ font-size: 1.3em; }}
+        input[type=password] {{ width: 100%%; padding: 10px; margin: 10px 0; box-sizing: border-box; font-size: 1em; }}
+        button {{ padding: 10px 24px; font-size: 1em; cursor: pointer; }}
+        .error {{ color: #c00; }}
     </style>
 </head>
 <body>
