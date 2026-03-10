@@ -12,7 +12,17 @@ from mcp.server.auth.settings import ClientRegistrationOptions
 
 # Simple typed dicts for token storage
 class AuthCode:
-    def __init__(self, code, client_id, redirect_uri, code_challenge, code_challenge_method, scopes, expires_at):
+    def __init__(
+        self,
+        code,
+        client_id,
+        redirect_uri,
+        code_challenge,
+        code_challenge_method,
+        scopes,
+        expires_at,
+        redirect_uri_provided_explicitly,
+    ):
         self.code = code
         self.client_id = client_id
         self.redirect_uri = redirect_uri
@@ -20,6 +30,7 @@ class AuthCode:
         self.code_challenge_method = code_challenge_method
         self.scopes = scopes
         self.expires_at = expires_at
+        self.redirect_uri_provided_explicitly = redirect_uri_provided_explicitly
 
 
 class Token:
@@ -73,6 +84,9 @@ class PersonalOAuthProvider(OAuthProvider):
             "code_challenge": params.code_challenge,
             "code_challenge_method": code_challenge_method or "S256",
             "scopes": params.scopes or [],
+            "redirect_uri_provided_explicitly": getattr(
+                params, "redirect_uri_provided_explicitly", True
+            ),
             "state": state,
         }
 
@@ -199,6 +213,9 @@ class PersonalOAuthProvider(OAuthProvider):
             code_challenge_method=pending["code_challenge_method"],
             scopes=pending["scopes"],
             expires_at=time.time() + 300,  # 5 min
+            redirect_uri_provided_explicitly=pending[
+                "redirect_uri_provided_explicitly"
+            ],
         )
 
         params = {"code": code}
