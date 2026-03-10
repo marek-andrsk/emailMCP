@@ -1,4 +1,5 @@
 import os
+import html
 
 from dotenv import load_dotenv
 
@@ -131,8 +132,9 @@ async def oauth_approve(request: Request):
         state = request.query_params.get("state", "")
         if not oauth.has_pending_auth(state):
             return HTMLResponse("<p>Invalid or expired authorization request.</p>", status_code=400)
-        html = APPROVE_HTML.format(state=state, error="")
-        return HTMLResponse(html)
+        safe_state = html.escape(state, quote=True)
+        html_body = APPROVE_HTML.format(state=safe_state, error="")
+        return HTMLResponse(html_body)
 
     # POST — verify password
     form = await request.form()
@@ -144,8 +146,9 @@ async def oauth_approve(request: Request):
 
     redirect_url = oauth.verify_and_approve(state, password)
     if not redirect_url:
-        html = APPROVE_HTML.format(state=state, error='<p class="error">Wrong password.</p>')
-        return HTMLResponse(html)
+        safe_state = html.escape(state, quote=True)
+        html_body = APPROVE_HTML.format(state=safe_state, error='<p class="error">Wrong password.</p>')
+        return HTMLResponse(html_body)
 
     return RedirectResponse(redirect_url, status_code=302)
 
