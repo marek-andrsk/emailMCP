@@ -643,12 +643,15 @@ class IMAPClient:
 
             from_hdr = self._decode_header(msg.get("From", ""))
             date_hdr = self._decode_header(msg.get("Date", ""))
-            header = f"On {date_hdr}, {from_hdr} wrote:"
+            header = f"> On {date_hdr}, {from_hdr} wrote:"
 
             quoted_lines = []
             for line in body_clean.splitlines():
                 if line.strip() == "":
                     quoted_lines.append(">")
+                elif line.lstrip().startswith(">"):
+                    # Preserve existing quote depth by adding one more level
+                    quoted_lines.append(f">{line}")
                 else:
                     quoted_lines.append(f"> {line}")
 
