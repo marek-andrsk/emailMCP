@@ -3,7 +3,9 @@ import email
 import email.utils
 import email.policy
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timezone
+import html as html_lib
 
 import html2text
 import imapclient
@@ -107,6 +109,36 @@ class IMAPClient:
                 break
             result.append(line)
         return "\n".join(result).strip()
+
+    def _extract_html(self, msg: email.message.Message) -> str | None:
+        """Extract first HTML part from a message, if present."""
+        if not msg.is_multipart():
+            if msg.get_content_type() != "text/html":
+                return None
+            payload = msg.get_payload(decode=True)
+            if payload is None:
+                return None
+            charset = msg.get_content_charset() or "utf-8"
+            try:
+                return payload.decode(charset, errors="replace").strip()
+            except (LookupError, UnicodeDecodeError):
+                return payload.decode("utf-8", errors="replace").strip()
+
+        for part in msg.walk():
+            if part.get_content_type() == "text/html":
+                payload = part.get_payload(decode=True)
+                if payload is None:
+                    continue
+                charset = part.get_content_charset() or "utf-8"
+                try:
+                    return payload.decode(charset, errors="replace").strip()
+                except (LookupError, UnicodeDecodeError):
+                    return payload.decode("utf-8", errors="replace").strip()
+        return None
+
+    def _text_to_html(self, text: str) -> str:
+        escaped = html_lib.escape(text)
+        return escaped.replace("\n", "<br>")
 
     def _decode_header(self, value: str | None) -> str:
         if not value:
@@ -560,8 +592,28 @@ class IMAPClient:
         # Extract reply-to address (the original sender)
         to_addr = original["from"]
 
-        # Build the draft message
-        draft = MIMEText(final_body, "plain", "utf-8")
+        # Build the draft message (plain or multipart/alternative)
+        conn = self.conn
+        conn.select_folder("INBOX", readonly=True)
+        raw = conn.fetch([reply_to_uid], ["RFC822"]).get(reply_to_uid, {}).get(b"RFC822")
+        html_part = None
+        if raw:
+            msg = email.message_from_bytes(raw, policy=email.policy.default)
+            html_part = self._extract_html(msg)
+
+        if html_part:
+            thread_html = self._build_thread_quote_html(original.get("thread_uids", []), reply_to_uid)
+            user_html = self._text_to_html(body.strip())
+            final_html = user_html
+            if thread_html:
+                final_html = f"{user_html}<br><br>{thread_html}"
+
+            draft = MIMEMultipart("alternative")
+            draft.attach(MIMEText(final_body, "plain", "utf-8"))
+            draft.attach(MIMEText(final_html, "html", "utf-8"))
+        else:
+            draft = MIMEText(final_body, "plain", "utf-8")
+
         draft["From"] = self.user
         draft["To"] = to_addr
         draft["Subject"] = subject
@@ -579,7 +631,6 @@ class IMAPClient:
             return f"Draft already saved (duplicate suppressed): reply to '{original['subject']}' → {to_addr}"
 
         # Save to Drafts via IMAP APPEND
-        conn = self.conn
         conn.append("Drafts", draft.as_bytes(), flags=[imapclient.DRAFT],
                      msg_time=datetime.now(timezone.utc))
         self._draft_dedupe[sig] = now_ts
@@ -662,3 +713,57 @@ class IMAPClient:
             return ""
 
         return "\n\n".join(blocks)
+
+    def _build_thread_quote_html(self, thread_uids: list[int], reply_to_uid: int) -> str:
+        """Build an HTML quoted thread block for drafts."""
+        if not thread_uids:
+            return ""
+
+        conn = self.conn
+        conn.select_folder("INBOX", readonly=True)
+        target_uids = [reply_to_uid] if reply_to_uid in thread_uids else thread_uids
+        meta = conn.fetch(
+            target_uids,
+            ["ENVELOPE", "INTERNALDATE", "RFC822"],
+        )
+
+        items = []
+        for uid, data in meta.items():
+            env = data.get(b"ENVELOPE")
+            if not env:
+                continue
+            date = self._message_date(data)
+            items.append((self._date_key(date), uid, data))
+
+        items.sort(key=lambda x: x[0])
+
+        blocks: list[str] = []
+        for _ts, uid, data in items:
+            raw = data.get(b"RFC822")
+            if not raw:
+                continue
+            msg = email.message_from_bytes(raw, policy=email.policy.default)
+
+            html_body = self._extract_html(msg)
+            if not html_body:
+                text_body = self._parse_body(msg)
+                if uid != reply_to_uid:
+                    text_body = self._strip_quoted_reply(text_body)
+                if not text_body:
+                    continue
+                html_body = self._text_to_html(text_body)
+
+            from_hdr = self._decode_header(msg.get("From", ""))
+            date_hdr = self._decode_header(msg.get("Date", ""))
+            header = (
+                f"<div class=\"quote-header\">"
+                f"On {html_lib.escape(date_hdr)}, {html_lib.escape(from_hdr)} wrote:"
+                f"</div>"
+            )
+            block = f"{header}<blockquote>{html_body}</blockquote>"
+            blocks.append(block)
+
+        if not blocks:
+            return ""
+
+        return "<br><br>".join(blocks)
