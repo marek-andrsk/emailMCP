@@ -23,6 +23,7 @@ class IMAPClient:
         self._conn: imapclient.IMAPClient | None = None
         self._sent_folder: str | None = None
         self._sent_reply_cache: dict[str, bool] = {}
+        self._draft_dedupe: dict[str, float] = {}
 
     def _connect(self) -> imapclient.IMAPClient:
         conn = imapclient.IMAPClient(self.host, port=self.port, ssl=True)
@@ -536,6 +537,10 @@ class IMAPClient:
     def save_draft(self, reply_to_uid: int, body: str) -> str:
         """Create a reply draft and save to Drafts folder."""
         original = self.read_email(reply_to_uid)
+        thread_quote = self._build_thread_quote(original.get("thread_uids", []), reply_to_uid)
+        final_body = body.strip()
+        if thread_quote:
+            final_body = f"{final_body}\n\n{thread_quote}"
 
         # Build reply subject
         subject = original["subject"]
@@ -556,7 +561,7 @@ class IMAPClient:
         to_addr = original["from"]
 
         # Build the draft message
-        draft = MIMEText(body, "plain", "utf-8")
+        draft = MIMEText(final_body, "plain", "utf-8")
         draft["From"] = self.user
         draft["To"] = to_addr
         draft["Subject"] = subject
@@ -566,9 +571,75 @@ class IMAPClient:
         if references:
             draft["References"] = references
 
+        # Dedupe rapid duplicate saves (e.g., client retries)
+        sig = f"{reply_to_uid}:{hash(final_body)}"
+        now_ts = datetime.now(timezone.utc).timestamp()
+        last_ts = self._draft_dedupe.get(sig)
+        if last_ts and (now_ts - last_ts) < 10:
+            return f"Draft already saved (duplicate suppressed): reply to '{original['subject']}' → {to_addr}"
+
         # Save to Drafts via IMAP APPEND
         conn = self.conn
         conn.append("Drafts", draft.as_bytes(), flags=[imapclient.DRAFT],
                      msg_time=datetime.now(timezone.utc))
+        self._draft_dedupe[sig] = now_ts
 
         return f"Draft saved: reply to '{original['subject']}' → {to_addr}"
+
+    def _build_thread_quote(self, thread_uids: list[int], reply_to_uid: int) -> str:
+        """Build a quoted thread block for drafts."""
+        if not thread_uids:
+            return ""
+
+        conn = self.conn
+        conn.select_folder("INBOX", readonly=True)
+        target_uids = [reply_to_uid] if reply_to_uid in thread_uids else thread_uids
+        meta = conn.fetch(
+            target_uids,
+            ["ENVELOPE", "INTERNALDATE", "RFC822"],
+        )
+
+        items = []
+        for uid, data in meta.items():
+            env = data.get(b"ENVELOPE")
+            if not env:
+                continue
+            date = self._message_date(data)
+            items.append((self._date_key(date), uid, data))
+
+        items.sort(key=lambda x: x[0])
+
+        blocks: list[str] = []
+        for _ts, uid, data in items:
+            if uid == reply_to_uid:
+                # Include the message being replied to and any earlier messages.
+                pass
+
+            raw = data.get(b"RFC822")
+            if not raw:
+                continue
+            msg = email.message_from_bytes(raw, policy=email.policy.default)
+
+            body = self._parse_body(msg)
+            body_clean = body if uid == reply_to_uid else self._strip_quoted_reply(body)
+            if not body_clean:
+                continue
+
+            from_hdr = self._decode_header(msg.get("From", ""))
+            date_hdr = self._decode_header(msg.get("Date", ""))
+            header = f"On {date_hdr}, {from_hdr} wrote:"
+
+            quoted_lines = []
+            for line in body_clean.splitlines():
+                if line.strip() == "":
+                    quoted_lines.append(">")
+                else:
+                    quoted_lines.append(f"> {line}")
+
+            block = "\n".join([header, *quoted_lines])
+            blocks.append(block)
+
+        if not blocks:
+            return ""
+
+        return "\n\n".join(blocks)
