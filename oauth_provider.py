@@ -7,6 +7,7 @@ from urllib.parse import urlencode
 
 from fastmcp.server.auth.auth import OAuthProvider
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+from mcp.server.auth.settings import ClientRegistrationOptions
 
 
 # Simple typed dicts for token storage
@@ -41,6 +42,7 @@ class PersonalOAuthProvider(OAuthProvider):
         super().__init__(
             base_url=base_url,
             issuer_url=base_url,
+            client_registration_options=ClientRegistrationOptions(enabled=True),
         )
         self.auth_password = auth_password
         self._clients: dict[str, OAuthClientInformationFull] = {}
