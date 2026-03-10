@@ -4,11 +4,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from fastmcp import FastMCP
-from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
+
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
+from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from imap_client import IMAPClient
 from oauth_provider import PersonalOAuthProvider
@@ -19,7 +21,31 @@ auth_password = os.environ["MCP_AUTH_PASSWORD"]
 oauth = PersonalOAuthProvider(base_url=base_url, auth_password=auth_password)
 
 # --- MCP Server ---
-mcp = FastMCP("Email MCP", auth=oauth)
+allowed_hosts = [
+    host.strip()
+    for host in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",")
+    if host.strip()
+]
+transport_security = None
+if allowed_hosts:
+    transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=allowed_hosts,
+    )
+
+resource_url = f"{base_url.rstrip('/')}/mcp"
+auth_settings = AuthSettings(
+    issuer_url=base_url,
+    resource_server_url=resource_url,
+    client_registration_options=ClientRegistrationOptions(enabled=True),
+    revocation_options=RevocationOptions(enabled=False),
+)
+mcp = FastMCP(
+    "Email MCP",
+    auth_server_provider=oauth,
+    auth=auth_settings,
+    transport_security=transport_security,
+)
 imap = IMAPClient()
 
 
@@ -130,23 +156,19 @@ async def health(request):
 
 
 # --- ASGI app ---
-middleware = [
-    Middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-        allow_headers=[
-            "mcp-protocol-version",
-            "mcp-session-id",
-            "Authorization",
-            "Content-Type",
-        ],
-        expose_headers=["mcp-session-id"],
-    ),
-]
-
-# Use stateless + JSON response mode for better compatibility behind proxies.
-app = mcp.http_app(middleware=middleware, stateless_http=True, json_response=True)
+app = mcp.streamable_http_app()
+app = CORSMiddleware(
+    app,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=[
+        "mcp-protocol-version",
+        "mcp-session-id",
+        "Authorization",
+        "Content-Type",
+    ],
+    expose_headers=["mcp-session-id"],
+)
 
 if __name__ == "__main__":
     import uvicorn
