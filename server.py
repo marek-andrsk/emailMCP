@@ -82,8 +82,19 @@ def read_email(uid: int) -> dict:
         "The draft will have correct In-Reply-To and References headers for proper threading."
     )
 )
-def save_draft(reply_to_uid: int, body: str) -> str:
-    return imap.save_draft(reply_to_uid, body)
+def draft_reply_email(reply_to_uid: int, body: str) -> str:
+    return imap.save_reply_draft(reply_to_uid, body)
+
+
+@mcp.tool(
+    description=(
+        "Save a NEW (non-reply) draft to the IMAP Drafts folder. This does NOT send the email. "
+        "Provide the recipient, subject, and plain text body. "
+        "No reply headers or quoted thread context are added."
+    )
+)
+def draft_new_email(to: str, subject: str, body: str) -> str:
+    return imap.save_new_draft(to, subject, body)
 
 
 # --- MCP Prompt ---

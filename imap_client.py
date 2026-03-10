@@ -534,7 +534,7 @@ class IMAPClient:
             "needs_reply": needs_reply,
         }
 
-    def save_draft(self, reply_to_uid: int, body: str) -> str:
+    def save_reply_draft(self, reply_to_uid: int, body: str) -> str:
         """Create a reply draft and save to Drafts folder."""
         original = self.read_email(reply_to_uid)
         thread_quote = self._build_thread_quote(original.get("thread_uids", []), reply_to_uid)
@@ -585,6 +585,22 @@ class IMAPClient:
         self._draft_dedupe[sig] = now_ts
 
         return f"Draft saved: reply to '{original['subject']}' → {to_addr}"
+
+    def save_new_draft(self, to_addr: str, subject: str, body: str) -> str:
+        """Create a new (non-reply) draft and save to Drafts folder."""
+        final_body = body.strip()
+
+        draft = MIMEText(final_body, "plain", "utf-8")
+        draft["From"] = self.user
+        draft["To"] = to_addr
+        draft["Subject"] = subject
+        draft["Date"] = email.utils.formatdate(localtime=True)
+
+        conn = self.conn
+        conn.append("Drafts", draft.as_bytes(), flags=[imapclient.DRAFT],
+                     msg_time=datetime.now(timezone.utc))
+
+        return f"Draft saved: new email to '{to_addr}'"
 
     def _build_thread_quote(self, thread_uids: list[int], reply_to_uid: int) -> str:
         """Build a quoted thread block for drafts."""
