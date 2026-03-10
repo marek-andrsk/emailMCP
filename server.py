@@ -51,8 +51,9 @@ imap = IMAPClient()
 
 @mcp.tool(
     description=(
-        "List all emails in the inbox. Returns metadata only: uid, from, subject, date, snippet. "
-        "After calling this, present emails to the user ONE AT A TIME using read_email. "
+        "List inbox threads (latest message per thread). Returns metadata only: uid, from, subject, date, snippet, "
+        "thread_uids, needs_reply. "
+        "After calling this, present threads to the user ONE AT A TIME using read_email on the latest uid. "
         "For each email: summarize it, then ask the user if they want to reply, skip, or stop reviewing. "
         "Do NOT read all emails at once."
     )
@@ -63,8 +64,8 @@ def list_inbox() -> list[dict]:
 
 @mcp.tool(
     description=(
-        "Read the full content of a single email by its UID. "
-        "Returns from, to, cc, subject, date, body, message_id, and references. "
+        "Read the full content of a single email by its UID. Thread-aware. "
+        "Returns from, to, cc, subject, date, body, message_id, references, thread_uids, thread_context, needs_reply. "
         "Use this to show the user a summary of the email content."
     )
 )

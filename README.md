@@ -6,8 +6,8 @@ Personal MCP server that gives Claude read access to your IMAP inbox and the abi
 
 | Tool | Description |
 |---|---|
-| `list_inbox` | List all emails in INBOX (metadata only: uid, from, subject, date, snippet) |
-| `read_email` | Read full email content by UID |
+| `list_inbox` | List inbox threads (latest message per thread; includes needs_reply + thread_uids) |
+| `read_email` | Read full email content by UID (thread-aware; includes thread_context + needs_reply) |
 | `save_draft` | Save a reply draft to IMAP Drafts folder (does NOT send) |
 
 ## Setup
