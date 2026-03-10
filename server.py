@@ -145,7 +145,8 @@ middleware = [
     ),
 ]
 
-app = mcp.http_app(middleware=middleware)
+# Use stateless + JSON response mode for better compatibility behind proxies.
+app = mcp.http_app(middleware=middleware, stateless_http=True, json_response=True)
 
 if __name__ == "__main__":
     import uvicorn
