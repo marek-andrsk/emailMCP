@@ -76,8 +76,9 @@ class PersonalOAuthProvider(OAuthProvider):
             "state": state,
         }
 
-        # Redirect to our approval page
-        return f"{self.base_url}/oauth/approve?state={state}"
+        # Redirect to our approval page (strip trailing slash to avoid //)
+        base = str(self.base_url).rstrip("/")
+        return f"{base}/oauth/approve?state={state}"
 
     # --- Auth Code ---
 
