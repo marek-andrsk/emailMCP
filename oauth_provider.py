@@ -66,11 +66,12 @@ class PersonalOAuthProvider(OAuthProvider):
         """Store the auth request and show a password page."""
         state = params.state or secrets.token_urlsafe(16)
 
+        code_challenge_method = getattr(params, "code_challenge_method", None)
         self._pending_auth[state] = {
             "client_id": client.client_id,
             "redirect_uri": str(params.redirect_uri),
             "code_challenge": params.code_challenge,
-            "code_challenge_method": params.code_challenge_method or "S256",
+            "code_challenge_method": code_challenge_method or "S256",
             "scopes": params.scopes or [],
             "state": state,
         }
