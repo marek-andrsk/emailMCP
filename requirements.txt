@@ -1,5 +1,8 @@
-fastmcp>=3.1.0
-imapclient>=3.0.0
-html2text>=2024.2.26
-python-dotenv>=1.0.0
-uvicorn>=0.34.0
+# Pinned exactly: an unpinned SDK is how production drifted ahead of local and
+# broke on a field the SDK had added (AccessToken.claims). Bump deliberately,
+# then run the suite.
+mcp==1.29.0
+imapclient==3.1.0
+html2text==2025.4.15
+python-dotenv==1.2.2
+uvicorn==0.41.0

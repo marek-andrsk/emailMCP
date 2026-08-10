@@ -24,14 +24,13 @@ IMAP UIDs are only unique within one mailbox, so every id the server returns car
 
 Mailboxes are defined by `MAILBOXES_JSON` — a JSON array of non-secret mailbox objects. That is the only source: one variable, no config file, no precedence rules. It reads from `.env` locally and from the platform's environment in production.
 
+**Keep it on one line.** The loader itself accepts newlines, but a deployment platform typically writes your variables into a `.env` file that `docker compose` reads, and that parser takes one `KEY=VALUE` per line — a wrapped JSON array makes it read `{"key": ...` as a variable name and the deploy fails before Python starts.
+
 ```
-MAILBOXES_JSON='[
-  {"key": "example.com", "label": "Example", "address": "me@example.com", "host": "imap.migadu.com"},
-  {"key": "second.example", "address": "me@second.example", "host": "imap.migadu.com"}
-]'
+MAILBOXES_JSON=[{"key":"example.com","label":"Example","address":"me@example.com","host":"imap.migadu.com"},{"key":"second.example","address":"me@second.example","host":"imap.migadu.com"}]
 ```
 
-A quoted multi-line value works in both `.env` and a Coolify-style textarea, so the list stays readable as it grows.
+No quotes around the value, no line breaks inside it. If your platform offers a "multiline variable" toggle, leave it off for this one.
 
 | Field | Required | Default | Notes |
 |---|---|---|---|

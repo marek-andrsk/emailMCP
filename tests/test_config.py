@@ -38,6 +38,8 @@ def test_loads_from_inline_json():
 
 
 def test_a_multiline_value_is_accepted():
+    """The loader tolerates newlines, but see the note in .env.example: a
+    deployment platform's .env goes through docker compose, which does not."""
     raw = """[
       {"key": "andrsk.cz", "address": "me@andrsk.cz"},
       {"key": "second.cz", "address": "me@second.cz"}

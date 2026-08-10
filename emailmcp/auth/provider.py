@@ -1,69 +1,56 @@
-import hashlib
-import base64
+"""OAuth 2.1 authorization server for a single-user MCP server.
+
+Codes and tokens are the SDK's own Pydantic models rather than bespoke classes.
+That matters: the SDK reads fields off these objects, and it grows new ones
+(``subject`` and ``claims`` arrived in mcp 1.29 and are read on every
+authenticated request). A hand-rolled stand-in silently lacks whatever was
+added last and fails at request time, not at import.
+
+Tokens live in memory, so a restart requires re-authorization.
+"""
+
+from __future__ import annotations
+
 import secrets
 import time
-import os
 from urllib.parse import urlencode
 
-from fastmcp.server.auth.auth import OAuthProvider
+from mcp.server.auth.provider import (
+    AccessToken,
+    AuthorizationCode,
+    AuthorizationParams,
+    RefreshToken,
+)
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
-from mcp.server.auth.settings import ClientRegistrationOptions
+
+ACCESS_TOKEN_TTL = 86400  # 24 hours
+REFRESH_TOKEN_TTL = 604800  # 7 days
+AUTH_CODE_TTL = 300  # 5 minutes
+
+# There is exactly one principal: the person holding MCP_AUTH_PASSWORD. Naming
+# it lets the SDK compare the principal that created a session against the one
+# making each request, instead of degrading to a client_id-only comparison.
+OWNER_SUBJECT = "owner"
 
 
-# Simple typed dicts for token storage
-class AuthCode:
-    def __init__(
-        self,
-        code,
-        client_id,
-        redirect_uri,
-        code_challenge,
-        code_challenge_method,
-        scopes,
-        expires_at,
-        redirect_uri_provided_explicitly,
-    ):
-        self.code = code
-        self.client_id = client_id
-        self.redirect_uri = redirect_uri
-        self.code_challenge = code_challenge
-        self.code_challenge_method = code_challenge_method
-        self.scopes = scopes
-        self.expires_at = expires_at
-        self.redirect_uri_provided_explicitly = redirect_uri_provided_explicitly
+class PersonalOAuthProvider:
+    """Implements the SDK's OAuthAuthorizationServerProvider protocol.
 
-
-class Token:
-    def __init__(self, token, client_id, scopes, expires_at):
-        self.token = token
-        self.client_id = client_id
-        self.scopes = scopes
-        self.expires_at = expires_at
-
-
-class PersonalOAuthProvider(OAuthProvider):
-    """Simple OAuth provider for a single-user MCP server.
-
-    Supports Dynamic Client Registration (DCR) so Claude can auto-register.
-    Authorization requires entering a password in the browser (one-time).
-    Tokens are stored in memory — server restart requires re-auth.
+    Supports Dynamic Client Registration so Claude can auto-register.
+    Authorization requires entering a password in the browser, once.
     """
 
     def __init__(self, base_url: str, auth_password: str):
-        super().__init__(
-            base_url=base_url,
-            issuer_url=base_url,
-            client_registration_options=ClientRegistrationOptions(enabled=True),
-        )
+        self.base_url = base_url.rstrip("/")
         self.auth_password = auth_password
         self._clients: dict[str, OAuthClientInformationFull] = {}
-        self._auth_codes: dict[str, AuthCode] = {}
-        self._access_tokens: dict[str, Token] = {}
-        self._refresh_tokens: dict[str, Token] = {}
-        # Pending authorization requests (state -> params)
+        self._auth_codes: dict[str, AuthorizationCode] = {}
+        self._access_tokens: dict[str, AccessToken] = {}
+        self._refresh_tokens: dict[str, RefreshToken] = {}
+        # Pending authorization requests, keyed by state.
         self._pending_auth: dict[str, dict] = {}
 
-    # --- Client Management ---
+    # --- Client management ---
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
         return self._clients.get(client_id)
@@ -73,156 +60,149 @@ class PersonalOAuthProvider(OAuthProvider):
 
     # --- Authorization ---
 
-    async def authorize(self, client, params) -> str:
-        """Store the auth request and show a password page."""
+    async def authorize(
+        self, client: OAuthClientInformationFull, params: AuthorizationParams
+    ) -> str:
+        """Park the request and send the browser to the password page."""
         state = params.state or secrets.token_urlsafe(16)
 
-        code_challenge_method = getattr(params, "code_challenge_method", None)
         self._pending_auth[state] = {
             "client_id": client.client_id,
             "redirect_uri": str(params.redirect_uri),
             "code_challenge": params.code_challenge,
-            "code_challenge_method": code_challenge_method or "S256",
             "scopes": params.scopes or [],
-            "redirect_uri_provided_explicitly": getattr(
-                params, "redirect_uri_provided_explicitly", True
-            ),
-            "state": state,
+            "resource": params.resource,
+            "redirect_uri_provided_explicitly": params.redirect_uri_provided_explicitly,
+            "state": params.state,
         }
 
-        # Redirect to our approval page (strip trailing slash to avoid //)
-        base = str(self.base_url).rstrip("/")
-        return f"{base}/oauth/approve?state={state}"
+        return f"{self.base_url}/oauth/approve?state={state}"
 
-    # --- Auth Code ---
+    # --- Authorization code ---
 
-    async def load_authorization_code(self, client, authorization_code: str):
-        ac = self._auth_codes.get(authorization_code)
-        if not ac:
+    async def load_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: str
+    ) -> AuthorizationCode | None:
+        code = self._auth_codes.get(authorization_code)
+        if code is None or code.client_id != client.client_id:
             return None
-        if ac.client_id != client.client_id:
-            return None
-        if time.time() > ac.expires_at:
+        if time.time() > code.expires_at:
             self._auth_codes.pop(authorization_code, None)
             return None
-        return ac
+        return code
 
-    async def exchange_authorization_code(self, client, authorization_code) -> OAuthToken:
-        access = secrets.token_urlsafe(48)
-        refresh = secrets.token_urlsafe(48)
-        now = time.time()
-
-        self._access_tokens[access] = Token(
-            token=access,
-            client_id=client.client_id,
-            scopes=authorization_code.scopes,
-            expires_at=now + 86400,  # 24 hours
-        )
-        self._refresh_tokens[refresh] = Token(
-            token=refresh,
-            client_id=client.client_id,
-            scopes=authorization_code.scopes,
-            expires_at=now + 604800,  # 7 days
-        )
-
-        # Remove used auth code
+    async def exchange_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
+    ) -> OAuthToken:
         self._auth_codes.pop(authorization_code.code, None)
-
-        return OAuthToken(
-            access_token=access,
-            token_type="bearer",
-            refresh_token=refresh,
-            expires_in=86400,
+        return self._issue(
+            client_id=client.client_id,
+            scopes=authorization_code.scopes,
+            resource=authorization_code.resource,
         )
 
-    # --- Token Validation ---
+    # --- Token validation ---
 
-    async def load_access_token(self, token: str):
-        t = self._access_tokens.get(token)
-        if not t:
+    async def load_access_token(self, token: str) -> AccessToken | None:
+        access = self._access_tokens.get(token)
+        if access is None:
             return None
-        if time.time() > t.expires_at:
+        if access.expires_at is not None and time.time() > access.expires_at:
             self._access_tokens.pop(token, None)
             return None
-        return t
+        return access
 
     # --- Refresh ---
 
-    async def load_refresh_token(self, client, refresh_token: str):
-        rt = self._refresh_tokens.get(refresh_token)
-        if not rt:
+    async def load_refresh_token(
+        self, client: OAuthClientInformationFull, refresh_token: str
+    ) -> RefreshToken | None:
+        token = self._refresh_tokens.get(refresh_token)
+        if token is None or token.client_id != client.client_id:
             return None
-        if rt.client_id != client.client_id:
-            return None
-        if time.time() > rt.expires_at:
+        if token.expires_at is not None and time.time() > token.expires_at:
             self._refresh_tokens.pop(refresh_token, None)
             return None
-        return rt
+        return token
 
-    async def exchange_refresh_token(self, client, refresh_token, scopes) -> OAuthToken:
-        access = secrets.token_urlsafe(48)
-        new_refresh = secrets.token_urlsafe(48)
-        now = time.time()
-        use_scopes = scopes or refresh_token.scopes
-
-        self._access_tokens[access] = Token(
-            token=access,
-            client_id=client.client_id,
-            scopes=use_scopes,
-            expires_at=now + 86400,
-        )
-        self._refresh_tokens[new_refresh] = Token(
-            token=new_refresh,
-            client_id=client.client_id,
-            scopes=use_scopes,
-            expires_at=now + 604800,
-        )
-
-        # Rotate: remove old
+    async def exchange_refresh_token(
+        self,
+        client: OAuthClientInformationFull,
+        refresh_token: RefreshToken,
+        scopes: list[str] | None = None,
+    ) -> OAuthToken:
+        # Rotate: the presented refresh token is single-use.
         self._refresh_tokens.pop(refresh_token.token, None)
+        return self._issue(
+            client_id=client.client_id,
+            scopes=scopes or refresh_token.scopes,
+            resource=None,
+        )
+
+    async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
+        value = getattr(token, "token", str(token))
+        self._access_tokens.pop(value, None)
+        self._refresh_tokens.pop(value, None)
+
+    # --- Issuing ---
+
+    def _issue(self, client_id: str, scopes: list[str], resource: str | None) -> OAuthToken:
+        access_value = secrets.token_urlsafe(48)
+        refresh_value = secrets.token_urlsafe(48)
+        now = int(time.time())
+
+        self._access_tokens[access_value] = AccessToken(
+            token=access_value,
+            client_id=client_id,
+            scopes=scopes,
+            expires_at=now + ACCESS_TOKEN_TTL,
+            resource=resource,
+            subject=OWNER_SUBJECT,
+            claims={"iss": self.base_url, "sub": OWNER_SUBJECT},
+        )
+        self._refresh_tokens[refresh_value] = RefreshToken(
+            token=refresh_value,
+            client_id=client_id,
+            scopes=scopes,
+            expires_at=now + REFRESH_TOKEN_TTL,
+            subject=OWNER_SUBJECT,
+        )
 
         return OAuthToken(
-            access_token=access,
+            access_token=access_value,
             token_type="bearer",
-            refresh_token=new_refresh,
-            expires_in=86400,
+            refresh_token=refresh_value,
+            expires_in=ACCESS_TOKEN_TTL,
         )
 
-    async def revoke_token(self, token) -> None:
-        tok = getattr(token, "token", str(token))
-        self._access_tokens.pop(tok, None)
-        self._refresh_tokens.pop(tok, None)
+    # --- Approval, called from the /oauth/approve route ---
 
-    # --- Approval Logic (called from custom route in server.py) ---
+    def has_pending_auth(self, state: str) -> bool:
+        return state in self._pending_auth
 
     def verify_and_approve(self, state: str, password: str) -> str | None:
-        """Verify password and return redirect URL with auth code, or None if invalid."""
-        if password != self.auth_password:
+        """Check the password and return the redirect URL carrying the code."""
+        if not secrets.compare_digest(password, self.auth_password):
             return None
 
         pending = self._pending_auth.pop(state, None)
-        if not pending:
+        if pending is None:
             return None
 
         code = secrets.token_urlsafe(32)
-        self._auth_codes[code] = AuthCode(
+        self._auth_codes[code] = AuthorizationCode(
             code=code,
             client_id=pending["client_id"],
             redirect_uri=pending["redirect_uri"],
+            redirect_uri_provided_explicitly=pending["redirect_uri_provided_explicitly"],
             code_challenge=pending["code_challenge"],
-            code_challenge_method=pending["code_challenge_method"],
             scopes=pending["scopes"],
-            expires_at=time.time() + 300,  # 5 min
-            redirect_uri_provided_explicitly=pending[
-                "redirect_uri_provided_explicitly"
-            ],
+            expires_at=time.time() + AUTH_CODE_TTL,
+            resource=pending["resource"],
+            subject=OWNER_SUBJECT,
         )
 
         params = {"code": code}
         if pending["state"]:
             params["state"] = pending["state"]
-
         return f"{pending['redirect_uri']}?{urlencode(params)}"
-
-    def has_pending_auth(self, state: str) -> bool:
-        return state in self._pending_auth
