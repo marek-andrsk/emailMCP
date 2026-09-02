@@ -18,21 +18,38 @@ import html2text
 SNIPPET_LENGTH = 150
 
 
-def _make_converter() -> html2text.HTML2Text:
+def _make_converter(ignore_images: bool) -> html2text.HTML2Text:
     converter = html2text.HTML2Text()
     converter.ignore_links = False
-    converter.ignore_images = True
+    converter.ignore_images = ignore_images
     converter.body_width = 0
     return converter
 
 
-def html_to_text(value: str) -> str:
+def _convert(value: str, ignore_images: bool) -> str:
     # A fresh converter per call. HTML2Text carries parser state across
     # handle(), and FastMCP runs sync tools in a worker-thread pool, so a
     # shared instance interleaves output between concurrently converted
     # messages (and trips its own parser assertions). Constructing one costs
     # roughly 6% of a conversion, which is not worth a lock.
-    return _make_converter().handle(value).strip()
+    return _make_converter(ignore_images).handle(value).strip()
+
+
+def html_to_text(value: str) -> str:
+    """Readable text. Images are dropped — nothing downstream can show them."""
+    return _convert(value, ignore_images=True)
+
+
+def html_to_markdown(value: str) -> str:
+    """Readable text keeping ``![alt](src)`` markers where the images sat."""
+    return _convert(value, ignore_images=False)
+
+
+def decode_text(data: bytes, charset: str) -> str:
+    try:
+        return data.decode(charset, errors="replace")
+    except (LookupError, UnicodeDecodeError):
+        return data.decode("utf-8", errors="replace")
 
 
 def _decode_payload(part: email.message.Message) -> str | None:
@@ -41,11 +58,7 @@ def _decode_payload(part: email.message.Message) -> str | None:
     # part would latch and shadow the real body later in the message.
     if not payload:
         return None
-    charset = part.get_content_charset() or "utf-8"
-    try:
-        return payload.decode(charset, errors="replace")
-    except (LookupError, UnicodeDecodeError):
-        return payload.decode("utf-8", errors="replace")
+    return decode_text(payload, part.get_content_charset() or "utf-8")
 
 
 def _first_usable_part(msg: email.message.Message, content_type: str) -> str | None:
@@ -207,14 +220,14 @@ def format_date(value: datetime | None) -> str:
     return value.strftime("%Y-%m-%d %H:%M") if value else ""
 
 
-def snippet(data: dict, length: int = SNIPPET_LENGTH) -> str:
+def snippet(data: dict) -> str:
     """Collapse the peeked body prefix into a one-line snippet."""
     raw = data.get(b"BODY[TEXT]<0>")
     if not raw:
         return ""
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8", errors="replace")
-    return " ".join(str(raw)[:length].strip().split())
+    return " ".join(str(raw)[:SNIPPET_LENGTH].strip().split())
 
 
 def flag_set(data: dict) -> set[str]:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 
@@ -72,9 +73,11 @@ def create_server() -> tuple[FastMCP, Registry]:
 
 
 def create_app():
-    mcp, _registry = create_server()
+    mcp, registry = create_server()
+    app = mcp.streamable_http_app()
+    _close_registry_on_shutdown(app, registry)
     return CORSMiddleware(
-        mcp.streamable_http_app(),
+        app,
         allow_origins=["*"],
         allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
         allow_headers=[
@@ -85,3 +88,24 @@ def create_app():
         ],
         expose_headers=["mcp-session-id"],
     )
+
+
+def _close_registry_on_shutdown(app, registry: Registry) -> None:
+    """Release the IMAP connections when the process stops.
+
+    FastMCP's own ``lifespan`` hook runs per MCP session, which is the wrong
+    scope for a connection pool shared by every session, so this composes onto
+    the ASGI app's lifespan instead. Starlette ignores ``on_shutdown`` handlers
+    once a lifespan is set, and the session manager already sets one.
+    """
+    inner = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def lifespan(scope):
+        async with inner(scope):
+            try:
+                yield
+            finally:
+                registry.close()
+
+    app.router.lifespan_context = lifespan

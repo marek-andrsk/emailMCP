@@ -39,100 +39,57 @@ def patch_imap(monkeypatch, queue):
     )
 
 
-@pytest.fixture
-def conn(monkeypatch):
-    patch_imap(monkeypatch, [FakeIMAP()])
+def connect(monkeypatch, *fakes) -> Connection:
+    patch_imap(monkeypatch, list(fakes))
     return Connection("host", 993, "user", "pass")
 
 
-def test_repeated_selection_of_the_same_folder_issues_one_select(conn):
-    with conn.folder("INBOX") as imap:
-        pass
+def test_selection_is_cached_and_restored_around_nesting(monkeypatch):
+    imap = FakeIMAP()
+    conn = connect(monkeypatch, imap)
+
     with conn.folder("INBOX"):
         pass
-    assert imap.selects == [("INBOX", True)]
-
-
-def test_readonly_change_forces_a_reselect(conn):
-    with conn.folder("INBOX", readonly=True) as imap:
-        pass
-    with conn.folder("INBOX", readonly=False):
-        pass
-    assert imap.selects == [("INBOX", True), ("INBOX", False)]
-
-
-def test_nested_folder_restores_the_outer_selection(conn):
-    with conn.folder("INBOX") as imap:
-        with conn.folder("Sent"):
-            pass
-        # Back on INBOX before the outer block continues.
-        assert imap.selects == [("INBOX", True), ("Sent", True), ("INBOX", True)]
-
-
-def test_nested_access_does_not_reprobe_the_connection(conn):
-    with conn.folder("INBOX") as imap:
+    with conn.folder("INBOX"):  # cached, no second SELECT
         with conn.folder("Sent"):
             with conn.session():
                 pass
-    # One liveness probe for the outermost acquisition only.
-    assert imap.noops <= 1
-
-
-def test_a_dead_connection_is_replaced_and_the_selection_cache_reset(monkeypatch):
-    dead = FakeIMAP(fail_noop=True)
-    fresh = FakeIMAP()
-    patch_imap(monkeypatch, [dead, fresh])
-    connection = Connection("host", 993, "user", "pass")
-
-    with connection.folder("INBOX"):
+    with conn.folder("INBOX", readonly=False):  # a mode change is a real change
         pass
-    assert dead.selects == [("INBOX", True)]
 
-    with connection.folder("INBOX"):
-        pass
-    # Reconnected, and INBOX was selected again rather than assumed.
-    assert dead.logged_out
-    assert fresh.selects == [("INBOX", True)]
-
-
-def test_a_failed_select_does_not_leave_a_stale_cache(monkeypatch):
-    imap = FakeIMAP(unselectable={"Sent"})
-    patch_imap(monkeypatch, [imap])
-    connection = Connection("host", 993, "user", "pass")
-
-    with connection.folder("INBOX"):
-        pass
-    with pytest.raises(RuntimeError):
-        with connection.folder("Sent"):
-            pass
-
-    assert connection._selected is None
-
-    # The next call must issue a real SELECT rather than trust a cache that
-    # still named INBOX while the server had nothing selected.
-    with connection.folder("INBOX"):
-        pass
-    assert imap.selects == [("INBOX", True), ("INBOX", True)]
-
-
-def test_a_failed_nested_select_restores_the_enclosing_folder(monkeypatch):
-    imap = FakeIMAP(unselectable={"Sent"})
-    patch_imap(monkeypatch, [imap])
-    connection = Connection("host", 993, "user", "pass")
-
-    with connection.folder("INBOX"):
-        # Swallowed exactly as _has_sent_reply does for a missing Sent folder.
-        try:
-            with connection.folder("Sent"):
-                pass
-        except RuntimeError:
-            pass
-        # The outer block is genuinely back on INBOX, not just believed to be.
-        assert connection._selected == ("INBOX", True)
-
-    assert imap.selects == [("INBOX", True), ("INBOX", True)]
-
-
-def test_close_is_safe_when_never_connected(conn):
+    assert imap.selects == [
+        ("INBOX", True),
+        ("Sent", True),
+        ("INBOX", True),  # the inner block restored the enclosing selection
+        ("INBOX", False),
+    ]
+    # One liveness probe for the outermost acquisition of each top-level block.
+    assert imap.noops <= 3
     conn.close()
-    assert conn._conn is None
+
+
+def test_a_dead_connection_or_a_failed_select_never_leaves_a_stale_cache(monkeypatch):
+    """Trusting a cache the server does not share is how commands end up
+    running against whatever folder happened to be selected."""
+    dead, fresh = FakeIMAP(fail_noop=True), FakeIMAP()
+    conn = connect(monkeypatch, dead, fresh)
+
+    with conn.folder("INBOX"):
+        pass
+    with conn.folder("INBOX"):
+        pass
+    assert dead.logged_out
+    assert fresh.selects == [("INBOX", True)]  # reselected, not assumed
+
+    imap = FakeIMAP(unselectable={"Sent"})
+    conn = connect(monkeypatch, imap)
+    with conn.folder("INBOX"):
+        # Swallowed exactly as _has_sent_reply does for a missing Sent folder.
+        with pytest.raises(RuntimeError):
+            with conn.folder("Sent"):
+                pass
+        assert conn._selected == ("INBOX", True)
+    # The restore left a cache the server agrees with, so this one is free.
+    with conn.folder("INBOX"):
+        pass
+    assert imap.selects == [("INBOX", True), ("INBOX", True)]

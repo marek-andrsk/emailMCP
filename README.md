@@ -8,7 +8,8 @@ Personal MCP server that gives Claude read access to one or more IMAP mailboxes 
 |---|---|
 | `list_mailboxes` | List the configured mailboxes with their keys and addresses |
 | `list_inbox` | List inbox threads for one mailbox (latest message per thread; includes needs_reply + thread_ids) |
-| `read_email` | Read full email content by id (thread-aware; includes thread_context + needs_reply) |
+| `read_email` | Read full email content by id (thread-aware; body text interleaved with its inline images) |
+| `read_attachment` | Read one attachment or inline image by `part_id`, as an image or as text |
 | `draft_reply_email` | Save a reply draft to the Drafts folder of the mailbox the original lives in (does NOT send) |
 | `draft_new_email` | Save a NEW (non-reply) draft to a mailbox's Drafts folder (does NOT send) |
 
@@ -17,6 +18,14 @@ Personal MCP server that gives Claude read access to one or more IMAP mailboxes 
 IMAP UIDs are only unique within one mailbox, so every id the server returns carries its mailbox: `andrsk.cz:4211`. Pass those ids back verbatim — the mailbox travels with the UID, so a UID from one mailbox can never be paired with another mailbox's key.
 
 `list_inbox` and `draft_new_email` take a mailbox key instead, since no message id is available yet. `list_inbox` deliberately covers one mailbox at a time; to review several, call it once per mailbox.
+
+### Images and attachments
+
+`read_email` returns a JSON metadata block followed by the body: text and images in the order they appear in the message, so an image is read where it was written rather than in a detached list at the end. Images are decoded, scaled to at most 1568 px on the longest side and re-encoded, so a phone photo costs a sensible amount of context.
+
+Layout furniture is left out: anything under 50 px in either dimension or under 5 kB on the wire is a tracking pixel, spacer or bullet icon, and is dropped silently. Remote (`http`) images are never fetched — the request would itself be the tracking event the sender is waiting for. Past 8 images or 6 MB in one email, the rest are named in the text with the `part_id` to fetch them by.
+
+Everything that is not body text is listed under `attachments` with a `part_id`. `read_attachment` returns images as images and text attachments as text; other formats report what they are rather than returning bytes nothing can read.
 
 ## Setup
 

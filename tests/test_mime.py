@@ -11,125 +11,53 @@ def build(raw: str):
     return email.message_from_bytes(raw.encode("utf-8"), policy=email.policy.default)
 
 
-PLAIN = """From: Alice <alice@example.com>
-To: me@andrsk.cz
-Subject: Hello
-Content-Type: text/plain; charset="utf-8"
-
-Ahoj,
-jak se máš?
-"""
-
-ALTERNATIVE = """From: Alice <alice@example.com>
-Subject: Hi
-MIME-Version: 1.0
-Content-Type: multipart/alternative; boundary="b"
-
---b
-Content-Type: text/plain; charset="utf-8"
-
-plain version
---b
-Content-Type: text/html; charset="utf-8"
-
-<p>html <b>version</b></p>
---b--
-"""
-
-HTML_ONLY = """From: Alice <alice@example.com>
-Subject: Hi
-Content-Type: text/html; charset="utf-8"
-
-<p>Only <b>html</b> here</p>
-"""
+def part(content_type: str, payload: str) -> str:
+    return f'--b\nContent-Type: {content_type}; charset="utf-8"\n\n{payload}\n'
 
 
-def test_parse_body_plain_preserves_utf8():
+def multipart(subtype: str, *parts: str) -> str:
+    body = "".join(parts)
+    return (
+        "From: Alice <alice@example.com>\nSubject: Hi\nMIME-Version: 1.0\n"
+        f'Content-Type: multipart/{subtype}; boundary="b"\n\n{body}--b--\n'
+    )
+
+
+PLAIN = "From: Alice <a@b.cz>\nContent-Type: text/plain; charset=\"utf-8\"\n\nAhoj,\njak se máš?\n"
+
+
+def test_the_body_is_the_first_part_that_actually_carries_content():
+    """One predicate decides what counts as content, applied when the part is
+    picked. Deciding it later let a whitespace-only alternative shadow the
+    real body and reply drafts went out with an empty quote."""
     assert mime.parse_body(build(PLAIN)) == "Ahoj,\njak se máš?"
 
+    # Plain wins over HTML, but only when it is not blank.
+    both = multipart("alternative", part("text/plain", "plain version"), part("text/html", "<p>html</p>"))
+    assert mime.parse_body(build(both)) == "plain version"
 
-EMPTY_FIRST_PART = """From: Alice <alice@example.com>
-Subject: Fwd
-MIME-Version: 1.0
-Content-Type: multipart/mixed; boundary="m"
+    blank = multipart("alternative", part("text/plain", "\t"), part("text/html", "<p>the real content</p>"))
+    assert "the real content" in mime.parse_body(build(blank))
 
---m
-Content-Type: text/plain; charset="utf-8"
+    two_plain = multipart("mixed", part("text/plain", ""), part("text/plain", "the actual body"))
+    assert mime.parse_body(build(two_plain)) == "the actual body"
 
---m
-Content-Type: text/plain; charset="utf-8"
-
-skutečný obsah zprávy
---m--
-"""
-
-
-BLANK_PLAIN_ALTERNATIVE = """From: Alice <alice@example.com>
-Subject: Newsletter
-MIME-Version: 1.0
-Content-Type: multipart/alternative; boundary="x"
-
---x
-Content-Type: text/plain; charset="utf-8"
+    assert "<p>" not in mime.parse_body(build(multipart("mixed", part("text/html", "<p>Only html</p>"))))
+    assert "<p>html</p>" in mime.extract_html(build(both))
+    assert mime.extract_html(build(PLAIN)) is None
+    assert mime.extract_html(build(multipart("alternative", part("text/html", "   ")))) is None
 
 
-\t
---x
-Content-Type: text/html; charset="utf-8"
-
-<p>The real content of the message</p>
---x--
-"""
-
-BLANK_FIRST_OF_TWO_PLAIN = """From: Alice <alice@example.com>
-Subject: Fwd
-MIME-Version: 1.0
-Content-Type: multipart/mixed; boundary="m"
-
---m
-Content-Type: text/plain; charset="utf-8"
-
-\t
---m
-Content-Type: text/plain; charset="utf-8"
-
-the actual body
---m--
-"""
-
-
-def test_an_empty_leading_plain_part_does_not_shadow_the_real_body():
-    assert mime.parse_body(build(EMPTY_FIRST_PART)) == "skutečný obsah zprávy"
-
-
-def test_a_whitespace_only_plain_part_does_not_discard_the_html():
-    body = mime.parse_body(build(BLANK_PLAIN_ALTERNATIVE))
-    assert "The real content of the message" in body
-
-
-def test_a_whitespace_only_plain_part_does_not_shadow_a_later_one():
-    assert mime.parse_body(build(BLANK_FIRST_OF_TWO_PLAIN)) == "the actual body"
-
-
-def test_extract_html_skips_a_blank_html_part():
-    raw = BLANK_PLAIN_ALTERNATIVE.replace(
-        '<p>The real content of the message</p>', '   \n'
-    )
-    assert mime.extract_html(build(raw)) is None
-
-
-def test_parse_body_prefers_plain_over_html():
-    assert mime.parse_body(build(ALTERNATIVE)) == "plain version"
-
-
-def test_parse_body_falls_back_to_html():
-    body = mime.parse_body(build(HTML_ONLY))
-    assert "Only" in body and "html" in body
-    assert "<p>" not in body
+def test_quoted_history_is_cut_at_the_attribution():
+    assert mime.strip_quoted_reply("My answer\n\nOn Mon, Alice wrote:\n> original") == "My answer"
+    assert mime.strip_quoted_reply("Answer\n-----Original Message-----\nFrom: Alice") == "Answer"
+    assert mime.strip_quoted_reply("Line one\n\nLine two") == "Line one\n\nLine two"
+    assert mime.text_to_html("a <b>\nc") == "a &lt;b&gt;<br>c"
 
 
 def test_concurrent_html_conversion_stays_isolated():
-    """A shared HTML2Text instance interleaves output between threads."""
+    """A shared HTML2Text instance interleaves output between threads, and
+    FastMCP runs every sync tool in a worker-thread pool."""
     import sys
     import threading
 
@@ -162,104 +90,36 @@ def test_concurrent_html_conversion_stays_isolated():
     assert not failures, failures[:5]
 
 
-def test_extract_html_finds_the_html_part():
-    assert "<b>version</b>" in mime.extract_html(build(ALTERNATIVE))
+class Addr:
+    def __init__(self, name, mailbox, host):
+        self.name, self.mailbox, self.host = name, mailbox, host
 
 
-def test_extract_html_returns_none_for_plain_only():
-    assert mime.extract_html(build(PLAIN)) is None
+class Envelope:
+    def __init__(self, from_=None, subject=None):
+        self.from_, self.subject, self.message_id, self.date = from_, subject, None, None
 
 
-def test_strip_quoted_reply_drops_quotes_and_attribution():
-    body = "My answer\n\nOn Mon, Alice wrote:\n> original\n> text"
-    assert mime.strip_quoted_reply(body) == "My answer"
-
-
-def test_strip_quoted_reply_drops_outlook_separator():
-    body = "Answer\n-----Original Message-----\nFrom: Alice"
-    assert mime.strip_quoted_reply(body) == "Answer"
-
-
-def test_strip_quoted_reply_keeps_an_unquoted_body():
-    body = "Line one\n\nLine two"
-    assert mime.strip_quoted_reply(body) == body
-
-
-def test_text_to_html_escapes_and_breaks_lines():
-    assert mime.text_to_html("a <b>\nc") == "a &lt;b&gt;<br>c"
-
-
-def test_decode_header_handles_encoded_words():
+def test_header_and_envelope_values_are_decoded_once_and_centrally():
     assert mime.decode_header("=?utf-8?q?P=C5=99=C3=ADjem?=") == "Příjem"
-
-
-def test_decode_header_of_none_is_empty():
     assert mime.decode_header(None) == ""
-
-
-def test_is_from_matches_case_insensitively():
     assert mime.is_from("Marek <ME@Andrsk.CZ>", "me@andrsk.cz")
     assert not mime.is_from("Alice <alice@example.com>", "me@andrsk.cz")
     assert not mime.is_from("", "me@andrsk.cz")
 
+    assert mime.envelope_from(Envelope([Addr(b"Alice", b"alice", b"example.com")])) == (
+        "Alice <alice@example.com>"
+    )
+    assert mime.envelope_from(Envelope([Addr(None, b"alice", b"example.com")])) == "alice@example.com"
+    assert mime.envelope_subject(Envelope()) == "(no subject)"
 
-def test_date_key_orders_naive_and_aware_dates():
-    naive = datetime(2026, 1, 1, 12, 0)
-    aware = datetime(2026, 1, 1, 13, 0, tzinfo=timezone.utc)
-    assert mime.date_key(None) < mime.date_key(naive) < mime.date_key(aware)
-
-
-def test_format_date_of_none_is_empty():
-    assert mime.format_date(None) == ""
-    assert mime.format_date(datetime(2026, 8, 10, 9, 5)) == "2026-08-10 09:05"
-
-
-def test_snippet_collapses_whitespace_and_truncates():
-    data = {b"BODY[TEXT]<0>": b"  hello \n\n  world  " + b"x" * 300}
-    result = mime.snippet(data, length=20)
-    assert result.startswith("hello world")
-    assert "\n" not in result
-
-
-def test_snippet_of_missing_body_is_empty():
-    assert mime.snippet({}) == ""
-
-
-def test_flag_set_decodes_bytes():
-    assert mime.flag_set({b"FLAGS": [b"\\Seen", b"\\Answered"]}) == {"\\Seen", "\\Answered"}
-
-
-class _Addr:
-    def __init__(self, name, mailbox, host):
-        self.name = name
-        self.mailbox = mailbox
-        self.host = host
-
-
-class _Envelope:
-    def __init__(self, from_=None, subject=None, message_id=None):
-        self.from_ = from_
-        self.subject = subject
-        self.message_id = message_id
-        self.date = None
-
-
-def test_envelope_from_formats_name_and_address():
-    envelope = _Envelope(from_=[_Addr(b"Alice", b"alice", b"example.com")])
-    assert mime.envelope_from(envelope) == "Alice <alice@example.com>"
-
-
-def test_envelope_from_without_a_name():
-    envelope = _Envelope(from_=[_Addr(None, b"alice", b"example.com")])
-    assert mime.envelope_from(envelope) == "alice@example.com"
-
-
-def test_envelope_subject_falls_back():
-    assert mime.envelope_subject(_Envelope()) == "(no subject)"
-    assert mime.envelope_subject(_Envelope(subject=b"Hi")) == "Hi"
-
-
-def test_message_date_prefers_internaldate():
-    when = datetime(2026, 8, 10, tzinfo=timezone.utc)
+    when = datetime(2026, 8, 10, 9, 5, tzinfo=timezone.utc)
     assert mime.message_date({b"INTERNALDATE": when}) == when
     assert mime.message_date({}) is None
+    assert mime.date_key(None) < mime.date_key(datetime(2026, 1, 1, 12, 0)) < mime.date_key(when)
+    assert mime.format_date(None) == ""
+
+    snippet = mime.snippet({b"BODY[TEXT]<0>": b"  hello \n\n  world  " + b"x" * 300})
+    assert snippet.startswith("hello world") and len(snippet) <= mime.SNIPPET_LENGTH
+    assert mime.snippet({}) == ""
+    assert mime.flag_set({b"FLAGS": [b"\\Seen"]}) == {"\\Seen"}

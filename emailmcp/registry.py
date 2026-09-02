@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Iterator, Mapping
+from typing import Mapping
 
 from .config import Mailbox, password_for
 from .imap.store import MailStore
@@ -28,12 +28,6 @@ class Registry:
     @property
     def keys(self) -> list[str]:
         return list(self._stores)
-
-    def __len__(self) -> int:
-        return len(self._stores)
-
-    def __iter__(self) -> Iterator[MailStore]:
-        return iter(self._stores.values())
 
     def get(self, key: object) -> MailStore:
         name = str(key).strip() if key is not None else ""

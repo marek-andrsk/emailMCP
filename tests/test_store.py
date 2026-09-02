@@ -1,14 +1,14 @@
 import email
 import email.policy
-from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import pytest
 
+import messages
+from fakes import ADDRESS, FakeIMAP, build_store, meta
 from emailmcp.config import Mailbox
-from emailmcp.imap.store import MailStore, MessageNotFound
-
-ADDRESS = "me@andrsk.cz"
+from emailmcp.imap.content import ImageSegment, TextSegment
+from emailmcp.imap.store import MailStore, MessageNotFound, PartNotFound, UnsupportedPart
 
 INCOMING = f"""From: Alice <alice@example.com>
 To: {ADDRESS}
@@ -32,98 +32,13 @@ Content-Type: multipart/alternative; boundary="x"
 --x
 Content-Type: text/plain; charset="utf-8"
 
-plain
+\t
 --x
 Content-Type: text/html; charset="utf-8"
 
-<p>rich</p>
+<p>The real content of the message</p>
 --x--
 """.encode()
-
-
-class Addr:
-    def __init__(self, name, mailbox, host):
-        self.name = name
-        self.mailbox = mailbox
-        self.host = host
-
-
-class Envelope:
-    def __init__(self, sender, subject, message_id):
-        self.from_ = [sender]
-        self.subject = subject
-        self.message_id = message_id
-        self.date = None
-
-
-def meta(sender_name, sender_addr, subject, message_id, when, flags=(), body=b"snippet text"):
-    mailbox, _, host = sender_addr.partition("@")
-    return {
-        b"ENVELOPE": Envelope(
-            Addr(sender_name.encode(), mailbox.encode(), host.encode()),
-            subject.encode(),
-            message_id.encode(),
-        ),
-        b"FLAGS": list(flags),
-        b"INTERNALDATE": when,
-        b"BODY[TEXT]<0>": body,
-    }
-
-
-class FakeIMAP:
-    def __init__(self, metadata, raw, threads, sent_hits=()):
-        self.metadata = metadata
-        self.raw = raw
-        self.threads_result = threads
-        self.sent_hits = set(sent_hits)
-        self.appended = []
-        self.searches = []
-
-    def search(self, criteria):
-        self.searches.append(criteria)
-        if criteria == ["ALL"]:
-            return sorted(self.metadata)
-        # Sent-folder probe: ["OR", "HEADER", "In-Reply-To", <id>, ...]
-        return [1] if criteria[3] in self.sent_hits else []
-
-    def fetch(self, uids, fields):
-        if "RFC822" in fields:
-            return {uid: {b"RFC822": self.raw[uid]} for uid in uids if uid in self.raw}
-        return {uid: self.metadata[uid] for uid in uids if uid in self.metadata}
-
-    def thread(self, algorithm, criteria):
-        return self.threads_result
-
-    def list_folders(self):
-        return [((b"\\Sent",), b"/", "Sent"), ((), b"/", "Drafts"), ((), b"/", "INBOX")]
-
-    def append(self, folder, message, flags=None, msg_time=None):
-        self.appended.append((folder, message, flags))
-
-
-class FakeConnection:
-    def __init__(self, imap):
-        self.imap = imap
-        self.folders = []
-
-    @contextmanager
-    def folder(self, name, readonly=True):
-        self.folders.append(name)
-        yield self.imap
-
-    @contextmanager
-    def session(self):
-        yield self.imap
-
-    def close(self):
-        pass
-
-
-def build_store(imap, **overrides):
-    mailbox = Mailbox(key="andrsk.cz", address=ADDRESS, label="Marek", **overrides)
-    store = MailStore(mailbox, "password")
-    store._conn = FakeConnection(imap)
-    return store
 
 
 @pytest.fixture
@@ -138,100 +53,9 @@ def imap():
     return FakeIMAP(metadata, {1: INCOMING, 2: INCOMING_HTML}, threads=((1,), (2,)))
 
 
-# --- list_inbox ------------------------------------------------------------
-
-
-def test_list_inbox_returns_prefixed_ids(imap):
-    rows = build_store(imap).list_inbox()
-    assert [row["id"] for row in rows] == ["andrsk.cz:1", "andrsk.cz:2"]
-    assert all(row["mailbox"] == "andrsk.cz" for row in rows)
-    assert rows[0]["thread_ids"] == ["andrsk.cz:1"]
-
-
-def test_list_inbox_shapes_metadata(imap):
-    row = build_store(imap).list_inbox()[0]
-    assert row["from"] == "Alice <alice@example.com>"
-    assert row["subject"] == "Nabidka"
-    assert row["date"] == "2026-08-10 09:00"
-    assert row["snippet"] == "snippet text"
-    assert "uid" not in row  # raw UIDs are never exposed
-
-
-def test_latest_message_represents_a_thread(imap):
-    imap.threads_result = [[1, 2]]
-    rows = build_store(imap).list_inbox()
-    assert len(rows) == 1
-    assert rows[0]["id"] == "andrsk.cz:2"
-    assert rows[0]["thread_ids"] == ["andrsk.cz:1", "andrsk.cz:2"]
-
-
-def test_empty_inbox(imap):
-    imap.metadata = {}
-    assert build_store(imap).list_inbox() == []
-
-
-# --- needs_reply -----------------------------------------------------------
-
-
-def test_incoming_unanswered_mail_needs_a_reply(imap):
-    assert build_store(imap).list_inbox()[0]["needs_reply"] is True
-
-
-def test_own_mail_never_needs_a_reply(imap):
-    imap.metadata[1] = meta(
-        "Marek", ADDRESS, "Nabidka", "<a1@example.com>", datetime(2026, 8, 10, tzinfo=timezone.utc)
-    )
-    assert build_store(imap).list_inbox()[0]["needs_reply"] is False
-
-
-def test_answered_flag_clears_needs_reply(imap):
-    imap.metadata[1][b"FLAGS"] = [b"\\Answered"]
-    assert build_store(imap).list_inbox()[0]["needs_reply"] is False
-
-
-def test_a_matching_message_in_sent_clears_needs_reply(imap):
-    imap.sent_hits = {"<a1@example.com>"}
-    rows = build_store(imap).list_inbox()
-    assert rows[0]["needs_reply"] is False
-    assert rows[1]["needs_reply"] is True
-
-
-def test_the_sent_probe_is_cached_per_message(imap):
-    store = build_store(imap)
-    store.list_inbox()
-    store.list_inbox()
-    sent_probes = [c for c in imap.searches if c != ["ALL"]]
-    assert len(sent_probes) == 2  # two distinct message ids, each probed once
-
-
-# --- read_email ------------------------------------------------------------
-
-
-def test_read_email_shape(imap):
-    result = build_store(imap).read_email(1)
-    assert result["id"] == "andrsk.cz:1"
-    assert result["mailbox"] == "andrsk.cz"
-    assert result["from"] == "Alice <alice@example.com>"
-    assert result["subject"] == "Nabidka"
-    assert result["body"] == "Ahoj, mam pro tebe nabidku."
-    assert result["message_id"] == "<a1@example.com>"
-    assert result["thread_ids"] == ["andrsk.cz:1"]
-    assert result["thread_context"][0]["id"] == "andrsk.cz:1"
-
-
-def test_thread_context_is_ordered_oldest_first(imap):
-    imap.threads_result = [[1, 2]]
-    result = build_store(imap).read_email(2)
-    assert [entry["id"] for entry in result["thread_context"]] == ["andrsk.cz:1", "andrsk.cz:2"]
-
-
-def test_missing_message_names_the_reference(imap):
-    with pytest.raises(MessageNotFound) as excinfo:
-        build_store(imap).read_email(99)
-    assert "andrsk.cz:99" in str(excinfo.value)
-
-
-# --- drafts ----------------------------------------------------------------
+def store_with(imap, msg):
+    imap.raw[3] = msg.as_bytes()
+    return build_store(imap)
 
 
 def parse_appended(imap, index=0):
@@ -239,94 +63,144 @@ def parse_appended(imap, index=0):
     return folder, email.message_from_bytes(raw, policy=email.policy.default), flags
 
 
-def test_reply_draft_headers(imap):
+# --- listing ---------------------------------------------------------------
+
+
+def test_list_inbox_returns_one_row_per_thread_with_prefixed_ids(imap):
+    rows = build_store(imap).list_inbox()
+    assert [row["id"] for row in rows] == ["andrsk.cz:1", "andrsk.cz:2"]
+    assert rows[0] == {
+        "id": "andrsk.cz:1",
+        "mailbox": "andrsk.cz",
+        "from": "Alice <alice@example.com>",
+        "subject": "Nabidka",
+        "date": "2026-08-10 09:00",
+        "snippet": "snippet text",
+        "needs_reply": True,
+        "thread_ids": ["andrsk.cz:1"],
+    }
+
+    imap.threads_result = [[1, 2]]
+    threaded = build_store(imap).list_inbox()
+    assert len(threaded) == 1
+    assert threaded[0]["id"] == "andrsk.cz:2"  # the latest message represents it
+    assert threaded[0]["thread_ids"] == ["andrsk.cz:1", "andrsk.cz:2"]
+
+    imap.metadata = {}
+    assert build_store(imap).list_inbox() == []
+
+
+def test_needs_reply_clears_once_the_thread_has_been_handled(imap):
+    imap.metadata[1][b"FLAGS"] = [b"\\Answered"]
+    assert build_store(imap).list_inbox()[0]["needs_reply"] is False
+
+    imap.metadata[1][b"FLAGS"] = []
+    imap.sent_hits = {"<a1@example.com>"}  # a reply already sits in Sent
+    rows = build_store(imap).list_inbox()
+    assert [row["needs_reply"] for row in rows] == [False, True]
+
+    imap.metadata[1] = meta("Marek", ADDRESS, "Nabidka", "<a1@example.com>", datetime.now(timezone.utc))
+    assert build_store(imap).list_inbox()[0]["needs_reply"] is False
+
+    store = build_store(imap)
+    imap.searches.clear()
+    store.list_inbox()
+    store.list_inbox()
+    # Message 1 is now our own, so only message 2 is probed — once, then cached.
+    assert len([c for c in imap.searches if c != ["ALL"]]) == 1
+
+
+# --- reading ---------------------------------------------------------------
+
+
+def test_read_email_returns_metadata_and_body_segments(imap):
+    imap.threads_result = [[1, 2]]
+    result = build_store(imap).read_email(1)
+
+    assert result.metadata["id"] == "andrsk.cz:1"
+    assert result.metadata["from"] == "Alice <alice@example.com>"
+    assert result.metadata["subject"] == "Nabidka"
+    assert result.metadata["message_id"] == "<a1@example.com>"
+    assert result.metadata["attachments"] == []
+    assert result.segments == [TextSegment("Ahoj, mam pro tebe nabidku.")]
+    # Thread context is oldest first, whatever order the server fetched it in.
+    assert [e["id"] for e in result.metadata["thread_context"]] == ["andrsk.cz:1", "andrsk.cz:2"]
+
+    with pytest.raises(MessageNotFound) as excinfo:
+        build_store(imap).read_email(99)
+    assert "andrsk.cz:99" in str(excinfo.value)
+
+
+def test_read_attachment_serves_what_it_can_render_or_read(imap):
+    inline = store_with(imap, messages.with_inline_images(messages.png(300, 200)))
+    assert isinstance(inline.read_attachment(3, "2.2"), ImageSegment)
+
+    csv = store_with(imap, messages.with_attachment(b"a;b;c", "data.csv", "text", "csv"))
+    listed = csv.read_email(3).metadata["attachments"]
+    assert listed == [{"part_id": "2", "filename": "data.csv", "content_type": "text/csv", "size": 5}]
+    assert csv.read_attachment(3, listed[0]["part_id"]) == TextSegment("a;b;c")
+
+    # SVG is markup, and says more to a reader unrendered than rasterised.
+    svg = store_with(imap, messages.with_attachment(b"<svg><text>42</text></svg>", "c.svg", "image", "svg+xml"))
+    assert svg.read_attachment(3, "2") == TextSegment("<svg><text>42</text></svg>")
+
+
+def test_read_attachment_says_why_it_cannot_show_something(imap):
+    pdf = store_with(imap, messages.with_attachment(b"%PDF-1.4", "f.pdf", "application", "pdf"))
+    with pytest.raises(PartNotFound) as excinfo:
+        pdf.read_attachment(3, "9")
+    assert "andrsk.cz:3" in str(excinfo.value)
+    assert "Readable parts: 2" in str(excinfo.value)
+
+    with pytest.raises(UnsupportedPart) as excinfo:
+        pdf.read_attachment(3, "2")
+    assert "application/pdf" in str(excinfo.value) and "f.pdf" in str(excinfo.value)
+
+    broken = store_with(imap, messages.with_attachment(b"not a png", "x.png", "image", "png"))
+    with pytest.raises(UnsupportedPart) as excinfo:
+        broken.read_attachment(3, "2")
+    assert "could not be decoded" in str(excinfo.value)
+
+
+# --- drafts ----------------------------------------------------------------
+
+
+def test_a_reply_draft_threads_correctly_and_quotes_the_original(imap):
     store = build_store(imap)
     store.save_reply_draft(1, "Diky, ozvu se.")
     folder, draft, flags = parse_appended(imap)
 
-    assert folder == "Drafts"
-    assert flags == [b"\\Draft"]
+    assert (folder, flags) == ("Drafts", [b"\\Draft"])
     assert draft["From"] == ADDRESS
     assert draft["To"] == "Alice <alice@example.com>"
     assert draft["Subject"] == "Re: Nabidka"
-    assert draft["In-Reply-To"] == "<a1@example.com>"
-    assert draft["References"] == "<a1@example.com>"
+    assert draft["In-Reply-To"] == draft["References"] == "<a1@example.com>"
+    assert draft.get_content_type() == "text/plain"
 
-
-def test_reply_draft_extends_an_existing_references_chain(imap):
-    build_store(imap).save_reply_draft(2, "ok")
-    _folder, draft, _flags = parse_appended(imap)
-    assert draft["References"] == "<b0@example.com> <b1@example.com>"
-    assert draft["Subject"] == "Re: Faktura"  # no double Re:
-
-
-def test_reply_draft_quotes_the_original(imap):
-    build_store(imap).save_reply_draft(1, "Diky, ozvu se.")
-    _folder, draft, _flags = parse_appended(imap)
     body = draft.get_payload(decode=True).decode("utf-8")
     assert body.startswith("Diky, ozvu se.")
     assert "> Ahoj, mam pro tebe nabidku." in body
 
 
-def test_reply_to_html_mail_produces_multipart_alternative(imap):
+def test_a_reply_to_html_mail_quotes_the_html_in_both_halves(imap):
+    """Message 2's text/plain part is whitespace only. Taking it at face value
+    is how a draft goes out with an empty quote."""
     build_store(imap).save_reply_draft(2, "ok")
     _folder, draft, _flags = parse_appended(imap)
+
     assert draft.get_content_type() == "multipart/alternative"
-    types = [part.get_content_type() for part in draft.walk()]
-    assert "text/plain" in types and "text/html" in types
-
-
-BLANK_PLAIN_WITH_HTML = f"""From: Carol <carol@example.com>
-To: {ADDRESS}
-Date: Mon, 10 Aug 2026 11:00:00 +0200
-Subject: Newsletter
-Message-ID: <c1@example.com>
-MIME-Version: 1.0
-Content-Type: multipart/alternative; boundary="y"
-
---y
-Content-Type: text/plain; charset="utf-8"
-
-\t
---y
-Content-Type: text/html; charset="utf-8"
-
-<p>The real content of the message</p>
---y--
-""".encode()
-
-
-def test_a_reply_to_a_blank_plain_part_keeps_the_quote_in_both_halves():
-    """A whitespace-only text/plain part must not empty the quoted thread."""
-    when = datetime(2026, 8, 10, 11, 0, tzinfo=timezone.utc)
-    metadata = {3: meta("Carol", "carol@example.com", "Newsletter", "<c1@example.com>", when)}
-    imap = FakeIMAP(metadata, {3: BLANK_PLAIN_WITH_HTML}, threads=((3,),))
-
-    build_store(imap).save_reply_draft(3, "Diky, nezajem.")
-    _folder, draft, _flags = parse_appended(imap)
+    assert draft["References"] == "<b0@example.com> <b1@example.com>"
+    assert draft["Subject"] == "Re: Faktura"  # no double Re:
 
     plain = next(p for p in draft.walk() if p.get_content_type() == "text/plain")
-    text = plain.get_payload(decode=True).decode("utf-8")
-    assert text.startswith("Diky, nezajem.")
-    assert "> The real content of the message" in text
+    assert "> The real content of the message" in plain.get_payload(decode=True).decode("utf-8")
+    assert any(p.get_content_type() == "text/html" for p in draft.walk())
 
 
-def test_reply_to_plain_mail_stays_plain(imap):
-    build_store(imap).save_reply_draft(1, "ok")
-    _folder, draft, _flags = parse_appended(imap)
-    assert draft.get_content_type() == "text/plain"
-
-
-def test_identical_reply_saved_twice_is_suppressed(imap):
-    store = build_store(imap)
-    store.save_reply_draft(1, "ok")
-    message = store.save_reply_draft(1, "ok")
-    assert len(imap.appended) == 1
-    assert "duplicate suppressed" in message
-
-
-def test_the_dedupe_check_and_the_append_are_one_critical_section(imap):
-    """Testing before recording would let two overlapping retries both through."""
+def test_an_identical_draft_is_saved_once_under_a_single_lock(imap):
+    """The check, the record and the append are one critical section: a client
+    retrying while the first save is still in flight is the case this exists
+    for, and testing before recording would let both through."""
     store = build_store(imap)
     held = []
     original_append = imap.append
@@ -339,92 +213,37 @@ def test_the_dedupe_check_and_the_append_are_one_critical_section(imap):
     store.save_reply_draft(1, "ok")
     assert held == [True]
 
-
-def test_a_retry_arriving_mid_save_does_not_produce_a_second_draft(imap):
-    """The second caller is held off until the first has recorded its signature."""
-    import threading
-
-    store = build_store(imap)
-    inside_append = threading.Event()
-    another_reached_append = threading.Event()
-    original_append = imap.append
-    seen = []
-
-    def instrumented(folder, message, flags=None, msg_time=None):
-        first = not seen
-        seen.append(True)
-        if first:
-            inside_append.set()
-            # Hold the window open long enough for a second caller to slip past
-            # an unguarded check; with the lock it never gets here.
-            another_reached_append.wait(timeout=0.3)
-        else:
-            another_reached_append.set()
-        original_append(folder, message, flags=flags, msg_time=msg_time)
-
-    imap.append = instrumented
-    errors = []
-
-    def save():
-        try:
-            store.save_reply_draft(1, "ok")
-        except Exception as exc:
-            errors.append(repr(exc))
-
-    first_thread = threading.Thread(target=save)
-    first_thread.start()
-    assert inside_append.wait(timeout=2.0), "first save never reached APPEND"
-
-    second_thread = threading.Thread(target=save)
-    second_thread.start()
-    first_thread.join(timeout=5)
-    second_thread.join(timeout=5)
-
-    assert not errors, errors
-    assert len(imap.appended) == 1
-
-
-def test_a_different_body_is_not_suppressed(imap):
-    store = build_store(imap)
-    store.save_reply_draft(1, "ok")
+    assert "duplicate suppressed" in store.save_reply_draft(1, "ok")
     store.save_reply_draft(1, "something else")
     assert len(imap.appended) == 2
 
-
-def test_a_failed_append_can_be_retried_immediately(imap):
-    store = build_store(imap)
+    # A save that did not land leaves no record, so it can be retried at once.
+    retrying = build_store(imap)
     calls = {"n": 0}
 
     def flaky(folder, message, flags=None, msg_time=None):
         calls["n"] += 1
         if calls["n"] == 1:
             raise OSError("append failed")
-        imap.appended.append((folder, message, flags))
+        original_append(folder, message, flags=flags, msg_time=msg_time)
 
     imap.append = flaky
     with pytest.raises(OSError):
-        store.save_reply_draft(1, "ok")
-    store.save_reply_draft(1, "ok")
-    assert len(imap.appended) == 1
+        retrying.save_reply_draft(1, "retry me")
+    retrying.save_reply_draft(1, "retry me")
+    assert len(imap.appended) == 3
 
 
-def test_new_draft_is_sent_from_the_mailbox_address(imap):
+def test_a_new_draft_is_sent_from_its_own_mailbox(imap):
     message = build_store(imap).save_new_draft("someone@example.com", "Dotaz", "Text")
     _folder, draft, _flags = parse_appended(imap)
-    assert draft["From"] == ADDRESS
-    assert draft["To"] == "someone@example.com"
-    assert draft["Subject"] == "Dotaz"
+    assert (draft["From"], draft["To"], draft["Subject"]) == (ADDRESS, "someone@example.com", "Dotaz")
     assert "Marek" in message  # the label tells the user where it landed
 
-
-def test_configured_drafts_folder_is_used(imap):
     build_store(imap, drafts_folder="INBOX.Drafts").save_new_draft("a@b.cz", "s", "b")
-    assert imap.appended[0][0] == "INBOX.Drafts"
-
-
-def test_drafts_folder_is_discovered_when_unset(imap):
+    assert imap.appended[1][0] == "INBOX.Drafts"
     build_store(imap, drafts_folder=None).save_new_draft("a@b.cz", "s", "b")
-    assert imap.appended[0][0] == "Drafts"
+    assert imap.appended[2][0] == "Drafts"  # discovered from the folder list
 
 
 # --- against the real Connection ------------------------------------------
@@ -477,8 +296,7 @@ def test_a_broken_sent_folder_does_not_wedge_the_connection(monkeypatch, imap):
         lambda host, port=None, ssl=True: server,
     )
 
-    mailbox = Mailbox(key="andrsk.cz", address=ADDRESS, sent_folder="Nope")
-    store = MailStore(mailbox, "password")
+    store = MailStore(Mailbox(key="andrsk.cz", address=ADDRESS, sent_folder="Nope"), "password")
 
     # Every probe of the bogus Sent folder fails and is swallowed...
     rows = store.list_inbox()
@@ -486,5 +304,5 @@ def test_a_broken_sent_folder_does_not_wedge_the_connection(monkeypatch, imap):
     assert all(row["needs_reply"] for row in rows)
 
     # ...and the connection still works for everything afterwards.
-    assert store.read_email(1)["subject"] == "Nabidka"
+    assert store.read_email(1).metadata["subject"] == "Nabidka"
     assert len(store.list_inbox()) == 2

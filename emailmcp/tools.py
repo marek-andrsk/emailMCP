@@ -9,7 +9,9 @@ without an extra round trip.
 from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import CallToolResult
 
+from . import blocks
 from .registry import Registry
 
 
@@ -48,14 +50,29 @@ def register(mcp: FastMCP, registry: Registry) -> None:
     @mcp.tool(
         description=(
             "Read the full content of a single email. Thread-aware. "
-            "Returns from, to, cc, subject, date, body, message_id, references, thread_ids, "
-            "thread_context, needs_reply. "
+            "Returns a JSON block with from, to, cc, subject, date, message_id, references, "
+            "attachments, thread_ids, thread_context and needs_reply, followed by the body: "
+            "text interleaved with the images that appear in it, in the order they appear. "
+            "Images too large or too numerous to inline are named in the text instead, with the "
+            "part_id to pass to read_attachment. "
             "Use this to show the user a summary of the email content. " + id_note
         )
     )
-    def read_email(email_id: str) -> dict:
+    def read_email(email_id: str) -> CallToolResult:
         store, uid = registry.resolve(email_id)
-        return store.read_email(uid)
+        return blocks.email_result(store.read_email(uid))
+
+    @mcp.tool(
+        description=(
+            "Read one attachment or inline image of an email, by the part_id listed in "
+            "read_email's 'attachments' (or named in its body). Images come back as images, "
+            "text attachments as text; other formats cannot be read. "
+            "Call this only for a part you actually need — attachments can be large. " + id_note
+        )
+    )
+    def read_attachment(email_id: str, part_id: str) -> CallToolResult:
+        store, uid = registry.resolve(email_id)
+        return blocks.segment_result(store.read_attachment(uid, part_id))
 
     @mcp.tool(
         description=(

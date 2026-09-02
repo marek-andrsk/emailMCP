@@ -44,11 +44,7 @@ def parse_ref(raw: object, known_keys: Iterable[str]) -> MessageRef:
     loop a model uses to correct itself after a bad call.
     """
     known = list(known_keys)
-
-    if isinstance(raw, MessageRef):
-        text = str(raw)
-    else:
-        text = str(raw).strip()
+    text = str(raw).strip()
 
     if not text:
         raise InvalidMessageRef(

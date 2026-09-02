@@ -10,6 +10,7 @@ import email
 import email.policy
 import email.utils
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -18,11 +19,17 @@ import imapclient
 
 from ..config import Mailbox
 from ..refs import format_ref
-from . import folders, mime, threads
+from . import content, folders, images, mime, parts, threads
 from .connection import Connection
-from .quoting import QuotedMessage, build_html_quote, build_text_quote
+from .content import ImageSegment, Segment, TextSegment
+from .quoting import build_html_quote, build_text_quote
 
-METADATA_FIELDS = ["ENVELOPE", "FLAGS", "INTERNALDATE", "BODY.PEEK[TEXT]<0.300>"]
+METADATA_FIELDS = [
+    "ENVELOPE",
+    "FLAGS",
+    "INTERNALDATE",
+    f"BODY.PEEK[TEXT]<0.{mime.SNIPPET_LENGTH}>",
+]
 
 # Window in which an identical draft save is treated as a client retry.
 DRAFT_DEDUPE_SECONDS = 10
@@ -30,6 +37,22 @@ DRAFT_DEDUPE_SECONDS = 10
 
 class MessageNotFound(ValueError):
     pass
+
+
+class PartNotFound(ValueError):
+    pass
+
+
+class UnsupportedPart(ValueError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class EmailContent:
+    """One email: its headers as data, its body as an ordered run of segments."""
+
+    metadata: dict
+    segments: list[Segment]
 
 
 class MailStore:
@@ -167,7 +190,7 @@ class MailStore:
             )
         return email.message_from_bytes(raw, policy=email.policy.default)
 
-    def read_email(self, uid: int) -> dict:
+    def read_email(self, uid: int) -> EmailContent:
         with self._conn.folder(self.mailbox.inbox_folder, readonly=True) as conn:
             msg = self._fetch_message(conn, uid)
 
@@ -187,21 +210,58 @@ class MailStore:
             if entries:
                 needs_reply = self._needs_reply(entries[-1][2])
 
-        return {
-            "id": self.ref(uid),
-            "mailbox": self.key,
-            "from": mime.decode_header(msg["From"]),
-            "to": mime.decode_header(msg["To"]),
-            "cc": mime.decode_header(msg.get("Cc", "")),
-            "subject": mime.decode_header(msg["Subject"]),
-            "date": mime.decode_header(msg["Date"]),
-            "body": mime.strip_quoted_reply(mime.parse_body(msg)),
-            "message_id": msg.get("Message-ID", ""),
-            "references": msg.get("References", ""),
-            "thread_ids": [self.ref(thread_uid) for thread_uid in thread_uids],
-            "thread_context": thread_context,
-            "needs_reply": needs_reply,
-        }
+        body = content.render(msg, self.ref(uid))
+
+        return EmailContent(
+            metadata={
+                "id": self.ref(uid),
+                "mailbox": self.key,
+                "from": mime.decode_header(msg["From"]),
+                "to": mime.decode_header(msg["To"]),
+                "cc": mime.decode_header(msg.get("Cc", "")),
+                "subject": mime.decode_header(msg["Subject"]),
+                "date": mime.decode_header(msg["Date"]),
+                "message_id": msg.get("Message-ID", ""),
+                "references": msg.get("References", ""),
+                "attachments": [part.describe() for part in body.attachments],
+                "thread_ids": [self.ref(thread_uid) for thread_uid in thread_uids],
+                "thread_context": thread_context,
+                "needs_reply": needs_reply,
+            },
+            segments=body.segments,
+        )
+
+    def read_attachment(self, uid: int, part_id: str) -> Segment:
+        """One part of a message, as something the caller can actually look at."""
+        with self._conn.folder(self.mailbox.inbox_folder, readonly=True) as conn:
+            msg = self._fetch_message(conn, uid)
+
+        part = parts.find(msg, part_id)
+        if part is None:
+            available = ", ".join(
+                other.section for other in parts.inventory(msg) if not other.is_body
+            )
+            raise PartNotFound(
+                f"no part {part_id!r} in {self.ref(uid)}. "
+                f"Readable parts: {available or '(none)'}"
+            )
+
+        if part.is_text:
+            return TextSegment(part.text.strip())
+
+        if part.is_image:
+            image = images.render(part.data)
+            if image is None:
+                raise UnsupportedPart(
+                    f"part {part_id} of {self.ref(uid)} claims to be {part.content_type} "
+                    f"but its bytes could not be decoded as an image"
+                )
+            return ImageSegment(part.section, part.filename, image)
+
+        raise UnsupportedPart(
+            f"part {part_id} of {self.ref(uid)} is {part.content_type} "
+            f"({part.filename or 'unnamed'}); only images and text can be read"
+        )
 
     def save_reply_draft(self, uid: int, body: str) -> str:
         with self._conn.folder(self.mailbox.inbox_folder, readonly=True) as conn:
@@ -216,12 +276,11 @@ class MailStore:
         references = " ".join(part for part in (prior_refs, message_id) if part)
         to_addr = mime.decode_header(original["From"])
 
-        quoted = [QuotedMessage(uid, original)]
-        text_quote = build_text_quote(quoted, uid)
+        text_quote = build_text_quote(original)
         text_body = "\n\n".join(part for part in (body.strip(), text_quote) if part)
 
         if mime.extract_html(original):
-            html_quote = build_html_quote(quoted, uid)
+            html_quote = build_html_quote(original)
             html_body = "<br><br>".join(
                 part for part in (mime.text_to_html(body.strip()), html_quote) if part
             )
