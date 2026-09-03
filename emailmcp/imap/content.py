@@ -17,7 +17,14 @@ from . import images, mime, parts
 from .images import Budget, RenderedImage
 from .parts import MessagePart
 
-_IMAGE_MARKER = re.compile(r"!\[[^\]]*\]\(\s*([^)\s]*)[^)]*\)")
+# html2text writes an image as ![alt](src), escaping any bracket inside the
+# alt text, and wraps a clickable one in a link: [words ![alt](src) more](href).
+# The whole construct has to be consumed, or its syntax is left in the body.
+_IMAGE_MARKER = re.compile(
+    r"(?:\[(?P<before>(?:\\.|[^\[\]\\])*))?"
+    r"!\[(?:\\.|[^\]\\])*\]\(\s*(?P<src>[^)\s]*)[^)]*\)"
+    r"(?(before)(?P<after>(?:\\.|[^\[\]\\])*)\]\([^)]*\))"
+)
 _BLANK_RUN = re.compile(r"\n{3,}")
 
 
@@ -98,33 +105,37 @@ def _split(
     cursor = 0
 
     for match in _IMAGE_MARKER.finditer(markdown):
-        before = markdown[cursor : match.start()]
+        # A linked image carries the link's own words around it. The href is
+        # dropped — it is usually a click tracker — but the words are not.
+        lead = markdown[cursor : match.start()] + (match.group("before") or "")
+        trail = match.group("after") or ""
         cursor = match.end()
 
-        part = _resolve(match.group(1), by_cid)
+        part = _resolve(match.group("src"), by_cid)
         if part is None:
             # A remote image cannot be fetched — and must not be, since the
             # request is itself the tracking event the sender is waiting for.
-            _add_text(segments, before)
+            _add_text(segments, lead + trail)
             continue
 
         image = images.render(part.data)
         if image is None:
             # Nothing to inline, but read_attachment may still be able to serve
             # it, so it keeps its place in the text and stays an attachment.
-            _add_text(segments, before + _placeholder(part, ref))
+            _add_text(segments, lead + _placeholder(part, ref) + trail)
             continue
 
         # Everything below is accounted for in the body, so none of it is
         # repeated in the attachment list.
         inlined.add(part.section)
         if image.decorative:
-            _add_text(segments, before)
+            _add_text(segments, lead + trail)
         elif budget.take(image):
-            _add_text(segments, before)
+            _add_text(segments, lead)
             segments.append(ImageSegment(part.section, part.filename, image))
+            _add_text(segments, trail)
         else:
-            _add_text(segments, before + _placeholder(part, ref))
+            _add_text(segments, lead + _placeholder(part, ref) + trail)
 
     _add_text(segments, markdown[cursor:])
     return [segment for segment in map(_trimmed, segments) if segment is not None], inlined

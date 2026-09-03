@@ -1,3 +1,4 @@
+import base64
 import email
 import email.policy
 
@@ -7,6 +8,7 @@ from emailmcp.imap import images
 from emailmcp.imap.content import ImageSegment, TextSegment, render
 
 REF = "andrsk.cz:1"
+PNG = base64.b64encode(messages.png(300, 200)).decode()
 
 SVG_MAIL = """From: a@b.cz
 Subject: Org chart
@@ -25,6 +27,15 @@ Content-Disposition: inline
 <svg xmlns="http://www.w3.org/2000/svg"><text>Revenue 42</text></svg>
 --r--
 """
+
+
+RELATED = (
+    'From: a@b.cz\nSubject: x\nMIME-Version: 1.0\n'
+    'Content-Type: multipart/related; boundary="r"\n\n'
+    '--r\nContent-Type: text/html; charset="utf-8"\n\n{html}\n'
+    "--r\nContent-Type: image/png\nContent-ID: <c@d>\n"
+    "Content-Transfer-Encoding: base64\nContent-Disposition: inline\n\n" + PNG + "\n--r--\n"
+)
 
 
 def build(raw: str):
@@ -60,6 +71,22 @@ def test_inline_images_land_between_the_text_they_belong_to():
     assert [s.part_id for s in body.segments if isinstance(s, ImageSegment)] == ["2.2", "2.3"]
     assert texts(body) == ["before 0", "after 0\n\nbefore 1", "after 1"]
     assert body.attachments == []  # an inlined image is not repeated as a file
+
+
+def test_the_markup_around_an_image_never_leaks_into_the_body():
+    """html2text escapes brackets inside alt text and wraps a clickable image
+    in a link. Consuming only the inner ![](...) leaves its syntax behind."""
+    linked = build(RELATED.format(html='<a href="http://x.com">see <img src="cid:c@d"> now</a>'))
+    assert [type(s).__name__ for s in render(linked, REF).segments] == [
+        "TextSegment", "ImageSegment", "TextSegment"
+    ]
+    # The href is a click tracker and is dropped; the words around it are not.
+    assert texts(render(linked, REF)) == ["see", "now"]
+
+    escaped = build(RELATED.format(html='<p>a</p><img src="cid:c@d" alt="x]y">'))
+    body = render(escaped, REF)
+    assert texts(body) == ["a"]
+    assert [s.part_id for s in body.segments if isinstance(s, ImageSegment)] == ["2"]
 
 
 def test_images_worth_nothing_leave_no_trace():

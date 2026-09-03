@@ -13,16 +13,20 @@ async def run_lifespan(app):
 
 
 class FakeRegistry:
-    def __init__(self):
+    def __init__(self, order):
+        self.order = order
         self.closed = 0
 
     def close(self):
+        self.order.append("registry closed")
         self.closed += 1
 
 
-def test_the_registry_is_closed_when_the_process_stops():
+def test_the_registry_is_closed_only_once_every_session_is_gone():
     """FastMCP's own lifespan hook runs per MCP session, which is the wrong
-    scope for a connection pool every session shares."""
+    scope for a connection pool every session shares. Closing it while the
+    session manager is still up pulls the connection out from under a tool
+    call that is halfway through."""
     order = []
 
     @asynccontextmanager
@@ -32,14 +36,12 @@ def test_the_registry_is_closed_when_the_process_stops():
         order.append("session manager down")
 
     app = Starlette(lifespan=inner)
-    registry = FakeRegistry()
+    registry = FakeRegistry(order)
     _close_registry_on_shutdown(app, registry)
 
     anyio.run(run_lifespan, app)
 
-    assert registry.closed == 1
-    assert order == ["session manager up", "session manager down"]
-
+    assert order == ["session manager up", "session manager down", "registry closed"]
 
     # And still closed when the shutdown underneath it blows up.
     @asynccontextmanager
@@ -48,7 +50,7 @@ def test_the_registry_is_closed_when_the_process_stops():
         raise RuntimeError("shutdown blew up")
 
     app = Starlette(lifespan=failing)
-    registry = FakeRegistry()
+    registry = FakeRegistry([])
     _close_registry_on_shutdown(app, registry)
 
     with pytest.raises(RuntimeError):

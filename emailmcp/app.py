@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from contextlib import asynccontextmanager
 
+from anyio import to_thread
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -102,10 +103,13 @@ def _close_registry_on_shutdown(app, registry: Registry) -> None:
 
     @asynccontextmanager
     async def lifespan(scope):
-        async with inner(scope):
-            try:
+        try:
+            async with inner(scope):
                 yield
-            finally:
-                registry.close()
+        finally:
+            # After the sessions are gone, so no tool call finds its connection
+            # closed underneath it, and off the event loop, because closing
+            # takes each connection's lock and a worker may still hold one.
+            await to_thread.run_sync(registry.close)
 
     app.router.lifespan_context = lifespan
